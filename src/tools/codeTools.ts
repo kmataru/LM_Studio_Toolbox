@@ -1,12 +1,329 @@
 import { tool, text, type Tool } from "@lmstudio/sdk";
 import { z } from "zod";
-import { spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
+import { existsSync, statSync } from "fs";
 import { writeFile, rm } from "fs/promises";
-import { join } from "path";
+import { delimiter, join } from "path";
 import * as os from "os";
 import type { ToolContext } from "./context";
-import { createSafeToolImplementation, getDenoPath, getPythonPath } from "./helpers";
+import { createSafeToolImplementation, getDenoPath, getPythonPath, validatePath, type ToolCtxLike } from "./helpers";
 import { backgroundCommands, generateId, pruneBackgroundCommands, type BackgroundCommand } from "../backgroundCommands";
+
+// ─── .NET CLI ────────────────────────────────────────────────────────────────
+
+type EnvironmentMap = Record<string, string | undefined>;
+
+const DOTNET_MAX_CAPTURE_CHARS = 500_000;
+
+function getEnvKey(env: EnvironmentMap, wantedKey: string): string | undefined {
+  const wanted = wantedKey.toLowerCase();
+  return Object.keys(env).find(key => key.toLowerCase() === wanted);
+}
+
+function getEnvValue(env: EnvironmentMap, key: string): string | undefined {
+  const actualKey = getEnvKey(env, key);
+  return actualKey ? env[actualKey] : undefined;
+}
+
+function setEnvValue(env: EnvironmentMap, key: string, value: string): void {
+  const existingKey = getEnvKey(env, key);
+  if (existingKey && existingKey !== key) delete env[existingKey];
+  env[key] = value;
+}
+
+/** Parse the REG_SZ/REG_EXPAND_SZ rows emitted by `reg.exe query`. */
+export function parseWindowsRegistryEnvironment(output: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.match(/^\s{4}(.+?)\s{4}(REG_(?:EXPAND_)?SZ)\s{4}(.*)$/);
+    if (match) setEnvValue(env, match[1], match[3]);
+  }
+  return env;
+}
+
+function readWindowsRegistryEnvironment(registryKey: string): Record<string, string> {
+  const windowsDirectory = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const regExe = join(windowsDirectory, "System32", "reg.exe");
+  try {
+    const output = execFileSync(regExe, ["query", registryKey], {
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return parseWindowsRegistryEnvironment(output);
+  } catch {
+    return {};
+  }
+}
+
+function expandWindowsEnvironment(value: string, env: EnvironmentMap): string {
+  let expanded = value;
+  for (let pass = 0; pass < 8; pass += 1) {
+    const next = expanded.replace(/%([^%]+)%/g, (token, name: string) => getEnvValue(env, name) ?? token);
+    if (next === expanded) break;
+    expanded = next;
+  }
+  return expanded;
+}
+
+/**
+ * Resolve Windows profile variables that are normally synthesized for an
+ * interactive user process and therefore may be absent inside LM Studio.
+ */
+export function resolveWindowsHostRestoreEnvironment(
+  env: EnvironmentMap,
+  volatileEnv: EnvironmentMap,
+  shellFolders: EnvironmentMap,
+  homeDirectory: string = os.homedir(),
+  tempDirectory: string = os.tmpdir(),
+): Record<"USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "TEMP" | "TMP", string> {
+  const expansionEnv: EnvironmentMap = { ...env };
+  for (const [key, value] of Object.entries(volatileEnv)) {
+    if (value !== undefined) setEnvValue(expansionEnv, key, value);
+  }
+
+  const rawUserProfile = getEnvValue(volatileEnv, "USERPROFILE")
+    ?? getEnvValue(env, "USERPROFILE")
+    ?? homeDirectory;
+  setEnvValue(expansionEnv, "USERPROFILE", rawUserProfile);
+  const userProfile = expandWindowsEnvironment(rawUserProfile, expansionEnv);
+  setEnvValue(expansionEnv, "USERPROFILE", userProfile);
+
+  const rawAppData = getEnvValue(volatileEnv, "APPDATA")
+    ?? getEnvValue(shellFolders, "AppData")
+    ?? getEnvValue(env, "APPDATA")
+    ?? join(userProfile, "AppData", "Roaming");
+  const rawLocalAppData = getEnvValue(volatileEnv, "LOCALAPPDATA")
+    ?? getEnvValue(shellFolders, "Local AppData")
+    ?? getEnvValue(env, "LOCALAPPDATA")
+    ?? join(userProfile, "AppData", "Local");
+  const rawTemp = getEnvValue(volatileEnv, "TEMP")
+    ?? getEnvValue(env, "TEMP")
+    ?? tempDirectory;
+  const rawTmp = getEnvValue(volatileEnv, "TMP")
+    ?? getEnvValue(env, "TMP")
+    ?? rawTemp;
+
+  return {
+    USERPROFILE: userProfile,
+    APPDATA: expandWindowsEnvironment(rawAppData, expansionEnv),
+    LOCALAPPDATA: expandWindowsEnvironment(rawLocalAppData, expansionEnv),
+    TEMP: expandWindowsEnvironment(rawTemp, expansionEnv),
+    TMP: expandWindowsEnvironment(rawTmp, expansionEnv),
+  };
+}
+
+/** Resolve the user-scoped paths used by .NET/NuGet on macOS and Linux. */
+export function resolvePosixHostRestoreEnvironment(
+  env: EnvironmentMap,
+  homeDirectory: string = os.homedir(),
+  tempDirectory: string = os.tmpdir(),
+  userName: string = os.userInfo().username,
+): Record<"HOME" | "USER" | "LOGNAME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME" | "TMPDIR", string> {
+  const home = env.HOME || homeDirectory;
+  const user = env.USER || env.LOGNAME || userName;
+  return {
+    HOME: home,
+    USER: user,
+    LOGNAME: env.LOGNAME || env.USER || userName,
+    XDG_CONFIG_HOME: env.XDG_CONFIG_HOME || join(home, ".config"),
+    XDG_DATA_HOME: env.XDG_DATA_HOME || join(home, ".local", "share"),
+    XDG_CACHE_HOME: env.XDG_CACHE_HOME || join(home, ".cache"),
+    TMPDIR: env.TMPDIR || tempDirectory,
+  };
+}
+
+/** Merge PATH values without duplicate entries, preserving first-entry precedence. */
+export function mergePathValues(values: Array<string | undefined>): string {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const value of values) {
+    for (const rawEntry of (value ?? "").split(delimiter)) {
+      const entry = rawEntry.trim();
+      if (!entry) continue;
+      const identity = process.platform === "win32" ? entry.toLowerCase() : entry;
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        merged.push(entry);
+      }
+    }
+  }
+  return merged.join(delimiter);
+}
+
+/**
+ * Build the environment used by dotnet.
+ *
+ * LM Studio can retain a stale Windows environment when variables are added or
+ * changed after the app starts. Refreshing the current HKLM/HKCU values fixes
+ * that while retaining process-only variables injected by LM Studio itself.
+ */
+export function buildDotnetEnvironment(overrides: Record<string, string> = {}): {
+  env: NodeJS.ProcessEnv;
+  source: string;
+} {
+  const env: EnvironmentMap = { ...process.env };
+  let source = "inherited process environment";
+
+  if (process.platform === "win32") {
+    const machine = readWindowsRegistryEnvironment(
+      "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+    );
+    const user = readWindowsRegistryEnvironment("HKCU\\Environment");
+    const volatileUser = readWindowsRegistryEnvironment("HKCU\\Volatile Environment");
+    const userShellFolders = readWindowsRegistryEnvironment(
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+    );
+
+    for (const registryEnv of [machine, user]) {
+      for (const [key, value] of Object.entries(registryEnv)) {
+        if (key.toLowerCase() !== "path") setEnvValue(env, key, value);
+      }
+    }
+
+    const hostProfile = resolveWindowsHostRestoreEnvironment(env, volatileUser, userShellFolders);
+    for (const [key, value] of Object.entries(hostProfile)) setEnvValue(env, key, value);
+
+    const inheritedPath = getEnvValue(process.env, "Path");
+    const userPath = expandWindowsEnvironment(getEnvValue(user, "Path") ?? "", env);
+    const machinePath = expandWindowsEnvironment(getEnvValue(machine, "Path") ?? "", env);
+    setEnvValue(env, "Path", mergePathValues([inheritedPath, userPath, machinePath]));
+
+    for (const key of Object.keys(env)) {
+      const value = env[key];
+      if (value !== undefined) setEnvValue(env, key, expandWindowsEnvironment(value, env));
+    }
+    source = "process + current HKLM/HKCU environment + Windows restore profile/temp folders";
+  } else {
+    const hostProfile = resolvePosixHostRestoreEnvironment(env);
+    for (const [key, value] of Object.entries(hostProfile)) setEnvValue(env, key, value);
+    source = `process + ${process.platform} home/XDG/temp environment`;
+  }
+
+  for (const [key, value] of Object.entries(overrides)) setEnvValue(env, key, value);
+  setEnvValue(env, "DOTNET_NOLOGO", getEnvValue(env, "DOTNET_NOLOGO") ?? "1");
+  setEnvValue(env, "DOTNET_CLI_TELEMETRY_OPTOUT", getEnvValue(env, "DOTNET_CLI_TELEMETRY_OPTOUT") ?? "1");
+  return { env, source };
+}
+
+/** Resolve dotnet from explicit host/root variables, then the refreshed PATH. */
+export function resolveDotnetExecutable(env: EnvironmentMap): string {
+  const explicitHost = getEnvValue(env, "DOTNET_HOST_PATH");
+  if (explicitHost && existsSync(explicitHost)) return explicitHost;
+
+  const executableName = process.platform === "win32" ? "dotnet.exe" : "dotnet";
+  const dotnetRoot = getEnvValue(env, "DOTNET_ROOT");
+  if (dotnetRoot) {
+    const candidate = join(dotnetRoot, executableName);
+    if (existsSync(candidate)) return candidate;
+  }
+
+  for (const directory of (getEnvValue(env, "Path") ?? "").split(delimiter)) {
+    if (!directory) continue;
+    const candidate = join(directory.replace(/^"|"$/g, ""), executableName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return executableName;
+}
+
+function appendDotnetOutput(current: string, chunk: string): { text: string; truncated: boolean } {
+  const combined = current + chunk;
+  return combined.length <= DOTNET_MAX_CAPTURE_CHARS
+    ? { text: combined, truncated: false }
+    : { text: combined.slice(-DOTNET_MAX_CAPTURE_CHARS), truncated: true };
+}
+
+export interface RunDotnetInput {
+  command: string;
+  arguments?: string[];
+  cwd: string;
+  environment?: Record<string, string>;
+  timeoutSeconds?: number;
+  toolContext?: ToolCtxLike;
+}
+
+/** Execute any .NET CLI command, global option, application, or extension without shell parsing. */
+export async function runDotnetImpl({
+  command,
+  arguments: cliArguments = [],
+  cwd,
+  environment = {},
+  timeoutSeconds = 600,
+  toolContext,
+}: RunDotnetInput): Promise<Record<string, unknown>> {
+  const { env, source } = buildDotnetEnvironment(environment);
+  const executable = resolveDotnetExecutable(env);
+  const args = [command, ...cliArguments];
+
+  return new Promise(resolve => {
+    let stdout = "";
+    let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+    let settled = false;
+
+    const child = spawn(executable, args, {
+      cwd,
+      env,
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutSeconds * 1000);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      const captured = appendDotnetOutput(stdout, chunk);
+      stdout = captured.text;
+      stdoutTruncated ||= captured.truncated;
+      const statusLine = chunk.trim().split(/\r?\n/).filter(Boolean).pop();
+      if (statusLine) toolContext?.status(statusLine.slice(0, 300));
+    });
+    child.stderr.on("data", (chunk: string) => {
+      const captured = appendDotnetOutput(stderr, chunk);
+      stderr = captured.text;
+      stderrTruncated ||= captured.truncated;
+    });
+
+    child.on("error", error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        command: [executable, ...args],
+        cwd,
+        environment_source: source,
+        error: error.message,
+      });
+    });
+
+    child.on("close", (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        success: exitCode === 0 && !timedOut,
+        command: [executable, ...args],
+        cwd,
+        environment_source: source,
+        exit_code: exitCode,
+        signal,
+        timed_out: timedOut,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        stdout_truncated: stdoutTruncated,
+        stderr_truncated: stderrTruncated,
+      });
+    });
+  });
+}
 
 // ─── JavaScript (Deno sandbox) ────────────────────────────────────────────────
 
@@ -232,6 +549,67 @@ export function createCodeTools(ctx: ToolContext): Tool[] {
       },
       ctx.allowShell,
       "execute_command"
+    ),
+  }));
+
+  tools.push(tool({
+    name: "run_dotnet",
+    description: text`
+      Run any .NET CLI command, global option, application, or installed extension in the current workspace.
+
+      On Windows, this tool refreshes persisted user and machine environment variables before
+      starting dotnet and guarantees USERPROFILE, APPDATA, LOCALAPPDATA, TEMP, and TMP are populated
+      from the host user's Windows profile. On macOS and Linux, it guarantees HOME, USER, LOGNAME,
+      XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME, and TMPDIR are populated from host defaults.
+      This avoids stale or missing environment variables when LM Studio did not inherit them.
+
+      Put the first argument after 'dotnet' in 'command' (for example 'build', 'workload',
+      '--info', or a path to an application DLL). Pass every remaining CLI argument as a separate
+      item in 'arguments'; do not include the word 'dotnet'. For application arguments with
+      dotnet run, include '--' before the application arguments.
+    `,
+    parameters: {
+      command: z.string().min(1).describe(
+        "First argument after dotnet, such as 'build', 'new', 'tool', 'workload', '--info', or an application DLL path.",
+      ),
+      arguments: z.array(z.string()).optional().describe(
+        "Remaining arguments, for example ['install', 'wasm-tools'] after command='workload'.",
+      ),
+      working_directory: z.string().optional().describe(
+        "Workspace-relative directory in which to run. Omit to use the current working directory.",
+      ),
+      environment: z.record(z.string()).optional().describe(
+        "Optional environment-variable overrides for this invocation. Values are not returned.",
+      ),
+      timeout_seconds: z.number().int().min(1).max(3600).optional().describe(
+        "Maximum runtime in seconds. Defaults to 600.",
+      ),
+    },
+    implementation: createSafeToolImplementation(
+      async ({
+        command,
+        arguments: cliArguments,
+        working_directory,
+        environment,
+        timeout_seconds,
+      }, toolContext) => {
+        const cwd = working_directory
+          ? validatePath(ctx.cwd, working_directory, ctx.protectedPaths)
+          : ctx.cwd;
+        if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+          return { success: false, error: `Working directory does not exist or is not a directory: ${cwd}` };
+        }
+        return runDotnetImpl({
+          command,
+          arguments: cliArguments,
+          cwd,
+          environment,
+          timeoutSeconds: timeout_seconds,
+          toolContext,
+        });
+      },
+      ctx.allowDotnet,
+      "run_dotnet",
     ),
   }));
 
