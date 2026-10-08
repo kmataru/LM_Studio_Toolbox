@@ -78,8 +78,8 @@ describe("run_dotnet helpers", () => {
     );
   });
 
-  it("resolves Windows host profile variables when LM Studio did not inherit them", () => {
-    const profile = resolveWindowsHostRestoreEnvironment(
+  it("resolves Windows user and machine-folder variables when LM Studio did not inherit them", () => {
+    const hostEnvironment = resolveWindowsHostRestoreEnvironment(
       {},
       { USERPROFILE: "C:\\Users\\HostUser" },
       {
@@ -88,11 +88,35 @@ describe("run_dotnet helpers", () => {
       },
       "C:\\Fallback",
       "C:\\Windows\\Temp",
+      {
+        ProgramFilesDir: "C:\\Program Files",
+        "ProgramFilesDir (x86)": "C:\\Program Files (x86)",
+        CommonFilesDir: "C:\\Program Files\\Common Files",
+        "CommonFilesDir (x86)": "C:\\Program Files (x86)\\Common Files",
+      },
+      { "Common AppData": "C:\\ProgramData" },
+      "C:\\Windows",
+      "HostUser",
     );
-    assert.deepEqual(profile, {
+    assert.deepEqual(hostEnvironment, {
       USERPROFILE: "C:\\Users\\HostUser",
       APPDATA: "C:\\Users\\HostUser\\AppData\\Roaming",
       LOCALAPPDATA: "C:\\Users\\HostUser\\AppData\\Local",
+      ProgramData: "C:\\ProgramData",
+      ALLUSERSPROFILE: "C:\\ProgramData",
+      ProgramFiles: "C:\\Program Files",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      CommonProgramFiles: "C:\\Program Files\\Common Files",
+      "CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
+      SystemRoot: "C:\\Windows",
+      WINDIR: "C:\\Windows",
+      SystemDrive: "C:",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+      HOMEDRIVE: "C:",
+      HOMEPATH: "\\Users\\HostUser",
+      USERNAME: "HostUser",
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      OS: "Windows_NT",
       TEMP: "C:\\Windows\\Temp",
       TMP: "C:\\Windows\\Temp",
     });
@@ -242,6 +266,58 @@ describe("run_dotnet smoke test", () => {
 
   after(() => {
     fs.rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("restores when Windows machine-folder variables are missing from the parent", t => {
+    if (process.platform !== "win32" || !dotnetAvailable) {
+      t.skip("Windows with dotnet SDK 6+ required");
+      return;
+    }
+
+    const tempDirectory = path.join(workspace, ".tmp");
+    const strippedEnvironment = {
+      Path: process.env.Path,
+      USERPROFILE: process.env.USERPROFILE,
+      APPDATA: process.env.APPDATA,
+      LOCALAPPDATA: process.env.LOCALAPPDATA,
+      ProgramFiles: "",
+      "ProgramFiles(x86)": "",
+      ProgramData: "",
+      ALLUSERSPROFILE: "",
+      TEMP: tempDirectory,
+      TMP: tempDirectory,
+      SystemRoot: process.env.SystemRoot,
+      WINDIR: process.env.WINDIR,
+      SystemDrive: process.env.SystemDrive,
+      ComSpec: process.env.ComSpec,
+      DOTNET_CLI_HOME: path.join(workspace, ".dotnet-home"),
+      DOTNET_NOLOGO: "1",
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1",
+    };
+    const hostEnvironment = resolveWindowsHostRestoreEnvironment(
+      strippedEnvironment,
+      {},
+      {},
+      process.env.USERPROFILE,
+      tempDirectory,
+      {},
+      {},
+      process.env.SystemRoot,
+      process.env.USERNAME,
+    );
+    const env = { ...strippedEnvironment, ...hostEnvironment };
+    for (const key of ["APPDATA", "LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]) {
+      assert.ok(env[key], `${key} should be restored`);
+    }
+
+    const restore = spawnSync(resolveDotnetExecutable(env), ["restore", "--nologo"], {
+      cwd: workspace,
+      env,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 60_000,
+    });
+    assert.equal(restore.status, 0, restore.stderr || restore.stdout);
   });
 
   it("accepts global options, restores, builds, runs, tests, and forwards host environment", async t => {

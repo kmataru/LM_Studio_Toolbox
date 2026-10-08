@@ -3,7 +3,7 @@ import { z } from "zod";
 import { execFileSync, spawn } from "child_process";
 import { existsSync, statSync } from "fs";
 import { writeFile, rm } from "fs/promises";
-import { delimiter, join } from "path";
+import { delimiter, join, win32 } from "path";
 import * as os from "os";
 import type { ToolContext } from "./context";
 import { createSafeToolImplementation, getDenoPath, getPythonPath, validatePath, type ToolCtxLike } from "./helpers";
@@ -23,6 +23,11 @@ function getEnvKey(env: EnvironmentMap, wantedKey: string): string | undefined {
 function getEnvValue(env: EnvironmentMap, key: string): string | undefined {
   const actualKey = getEnvKey(env, key);
   return actualKey ? env[actualKey] : undefined;
+}
+
+function getNonEmptyEnvValue(env: EnvironmentMap, key: string): string | undefined {
+  const value = getEnvValue(env, key);
+  return value?.trim() ? value : undefined;
 }
 
 function setEnvValue(env: EnvironmentMap, key: string, value: string): void {
@@ -67,8 +72,8 @@ function expandWindowsEnvironment(value: string, env: EnvironmentMap): string {
 }
 
 /**
- * Resolve Windows profile variables that are normally synthesized for an
- * interactive user process and therefore may be absent inside LM Studio.
+ * Resolve Windows user and machine-folder variables that are normally
+ * synthesized for an interactive process and may be absent inside LM Studio.
  */
 export function resolveWindowsHostRestoreEnvironment(
   env: EnvironmentMap,
@@ -76,38 +81,125 @@ export function resolveWindowsHostRestoreEnvironment(
   shellFolders: EnvironmentMap,
   homeDirectory: string = os.homedir(),
   tempDirectory: string = os.tmpdir(),
-): Record<"USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "TEMP" | "TMP", string> {
+  systemFolders: EnvironmentMap = {},
+  commonShellFolders: EnvironmentMap = {},
+  windowsDirectory: string = getNonEmptyEnvValue(env, "SystemRoot")
+    ?? getNonEmptyEnvValue(env, "WINDIR")
+    ?? "C:\\Windows",
+  userName: string = os.userInfo().username,
+): Record<string, string> {
   const expansionEnv: EnvironmentMap = { ...env };
   for (const [key, value] of Object.entries(volatileEnv)) {
     if (value !== undefined) setEnvValue(expansionEnv, key, value);
   }
 
-  const rawUserProfile = getEnvValue(volatileEnv, "USERPROFILE")
-    ?? getEnvValue(env, "USERPROFILE")
+  const systemRoot = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "SystemRoot")
+      ?? getNonEmptyEnvValue(env, "WINDIR")
+      ?? windowsDirectory,
+    expansionEnv,
+  );
+  const parsedSystemRoot = win32.parse(systemRoot).root;
+  const systemDrive = getNonEmptyEnvValue(env, "SystemDrive")
+    ?? (parsedSystemRoot ? parsedSystemRoot.replace(/[\\/]$/, "") : "C:");
+  setEnvValue(expansionEnv, "SystemRoot", systemRoot);
+  setEnvValue(expansionEnv, "WINDIR", systemRoot);
+  setEnvValue(expansionEnv, "SystemDrive", systemDrive);
+
+  const rawUserProfile = getNonEmptyEnvValue(volatileEnv, "USERPROFILE")
+    ?? getNonEmptyEnvValue(env, "USERPROFILE")
     ?? homeDirectory;
   setEnvValue(expansionEnv, "USERPROFILE", rawUserProfile);
   const userProfile = expandWindowsEnvironment(rawUserProfile, expansionEnv);
   setEnvValue(expansionEnv, "USERPROFILE", userProfile);
 
-  const rawAppData = getEnvValue(volatileEnv, "APPDATA")
-    ?? getEnvValue(shellFolders, "AppData")
-    ?? getEnvValue(env, "APPDATA")
-    ?? join(userProfile, "AppData", "Roaming");
-  const rawLocalAppData = getEnvValue(volatileEnv, "LOCALAPPDATA")
-    ?? getEnvValue(shellFolders, "Local AppData")
-    ?? getEnvValue(env, "LOCALAPPDATA")
-    ?? join(userProfile, "AppData", "Local");
-  const rawTemp = getEnvValue(volatileEnv, "TEMP")
-    ?? getEnvValue(env, "TEMP")
+  const rawAppData = getNonEmptyEnvValue(volatileEnv, "APPDATA")
+    ?? getNonEmptyEnvValue(shellFolders, "AppData")
+    ?? getNonEmptyEnvValue(env, "APPDATA")
+    ?? win32.join(userProfile, "AppData", "Roaming");
+  const rawLocalAppData = getNonEmptyEnvValue(volatileEnv, "LOCALAPPDATA")
+    ?? getNonEmptyEnvValue(shellFolders, "Local AppData")
+    ?? getNonEmptyEnvValue(env, "LOCALAPPDATA")
+    ?? win32.join(userProfile, "AppData", "Local");
+  const appData = expandWindowsEnvironment(rawAppData, expansionEnv);
+  const localAppData = expandWindowsEnvironment(rawLocalAppData, expansionEnv);
+  setEnvValue(expansionEnv, "APPDATA", appData);
+  setEnvValue(expansionEnv, "LOCALAPPDATA", localAppData);
+
+  const programFiles = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "ProgramFiles")
+      ?? getNonEmptyEnvValue(systemFolders, "ProgramFilesDir")
+      ?? `${systemDrive}\\Program Files`,
+    expansionEnv,
+  );
+  setEnvValue(expansionEnv, "ProgramFiles", programFiles);
+  const programFilesX86 = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "ProgramFiles(x86)")
+      ?? getNonEmptyEnvValue(systemFolders, "ProgramFilesDir (x86)")
+      ?? (process.arch === "ia32" ? programFiles : `${systemDrive}\\Program Files (x86)`),
+    expansionEnv,
+  );
+  setEnvValue(expansionEnv, "ProgramFiles(x86)", programFilesX86);
+
+  const commonProgramFiles = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "CommonProgramFiles")
+      ?? getNonEmptyEnvValue(systemFolders, "CommonFilesDir")
+      ?? win32.join(programFiles, "Common Files"),
+    expansionEnv,
+  );
+  const commonProgramFilesX86 = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "CommonProgramFiles(x86)")
+      ?? getNonEmptyEnvValue(systemFolders, "CommonFilesDir (x86)")
+      ?? win32.join(programFilesX86, "Common Files"),
+    expansionEnv,
+  );
+
+  const defaultProgramData = `${systemDrive}\\ProgramData`;
+  setEnvValue(expansionEnv, "ProgramData", getNonEmptyEnvValue(env, "ProgramData") ?? defaultProgramData);
+  const programData = expandWindowsEnvironment(
+    getNonEmptyEnvValue(env, "ProgramData")
+      ?? getNonEmptyEnvValue(env, "ALLUSERSPROFILE")
+      ?? getNonEmptyEnvValue(commonShellFolders, "Common AppData")
+      ?? defaultProgramData,
+    expansionEnv,
+  );
+  setEnvValue(expansionEnv, "ProgramData", programData);
+  setEnvValue(expansionEnv, "ALLUSERSPROFILE", programData);
+
+  const rawTemp = getNonEmptyEnvValue(volatileEnv, "TEMP")
+    ?? getNonEmptyEnvValue(env, "TEMP")
     ?? tempDirectory;
-  const rawTmp = getEnvValue(volatileEnv, "TMP")
-    ?? getEnvValue(env, "TMP")
+  const rawTmp = getNonEmptyEnvValue(volatileEnv, "TMP")
+    ?? getNonEmptyEnvValue(env, "TMP")
     ?? rawTemp;
+  const parsedUserProfile = win32.parse(userProfile).root;
+  const homeDrive = getNonEmptyEnvValue(env, "HOMEDRIVE")
+    ?? (parsedUserProfile ? parsedUserProfile.replace(/[\\/]$/, "") : systemDrive);
+  const homePath = getNonEmptyEnvValue(env, "HOMEPATH")
+    ?? userProfile.slice(homeDrive.length)
+    ?? "\\";
 
   return {
     USERPROFILE: userProfile,
-    APPDATA: expandWindowsEnvironment(rawAppData, expansionEnv),
-    LOCALAPPDATA: expandWindowsEnvironment(rawLocalAppData, expansionEnv),
+    APPDATA: appData,
+    LOCALAPPDATA: localAppData,
+    ProgramData: programData,
+    ALLUSERSPROFILE: programData,
+    ProgramFiles: programFiles,
+    "ProgramFiles(x86)": programFilesX86,
+    CommonProgramFiles: commonProgramFiles,
+    "CommonProgramFiles(x86)": commonProgramFilesX86,
+    SystemRoot: systemRoot,
+    WINDIR: systemRoot,
+    SystemDrive: systemDrive,
+    ComSpec: getNonEmptyEnvValue(env, "ComSpec") ?? win32.join(systemRoot, "System32", "cmd.exe"),
+    HOMEDRIVE: homeDrive,
+    HOMEPATH: homePath || "\\",
+    USERNAME: getNonEmptyEnvValue(env, "USERNAME")
+      ?? getNonEmptyEnvValue(volatileEnv, "USERNAME")
+      ?? userName,
+    PATHEXT: getNonEmptyEnvValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD",
+    OS: getNonEmptyEnvValue(env, "OS") ?? "Windows_NT",
     TEMP: expandWindowsEnvironment(rawTemp, expansionEnv),
     TMP: expandWindowsEnvironment(rawTmp, expansionEnv),
   };
@@ -174,6 +266,12 @@ export function buildDotnetEnvironment(overrides: Record<string, string> = {}): 
     const userShellFolders = readWindowsRegistryEnvironment(
       "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
     );
+    const systemFolders = readWindowsRegistryEnvironment(
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
+    );
+    const commonShellFolders = readWindowsRegistryEnvironment(
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+    );
 
     for (const registryEnv of [machine, user]) {
       for (const [key, value] of Object.entries(registryEnv)) {
@@ -181,8 +279,16 @@ export function buildDotnetEnvironment(overrides: Record<string, string> = {}): 
       }
     }
 
-    const hostProfile = resolveWindowsHostRestoreEnvironment(env, volatileUser, userShellFolders);
-    for (const [key, value] of Object.entries(hostProfile)) setEnvValue(env, key, value);
+    const hostEnvironment = resolveWindowsHostRestoreEnvironment(
+      env,
+      volatileUser,
+      userShellFolders,
+      os.homedir(),
+      os.tmpdir(),
+      systemFolders,
+      commonShellFolders,
+    );
+    for (const [key, value] of Object.entries(hostEnvironment)) setEnvValue(env, key, value);
 
     const inheritedPath = getEnvValue(process.env, "Path");
     const userPath = expandWindowsEnvironment(getEnvValue(user, "Path") ?? "", env);
@@ -193,7 +299,7 @@ export function buildDotnetEnvironment(overrides: Record<string, string> = {}): 
       const value = env[key];
       if (value !== undefined) setEnvValue(env, key, expandWindowsEnvironment(value, env));
     }
-    source = "process + current HKLM/HKCU environment + Windows restore profile/temp folders";
+    source = "process + current HKLM/HKCU environment + Windows user/system/temp folders";
   } else {
     const hostProfile = resolvePosixHostRestoreEnvironment(env);
     for (const [key, value] of Object.entries(hostProfile)) setEnvValue(env, key, value);
