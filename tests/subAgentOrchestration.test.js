@@ -212,6 +212,76 @@ describe("consult_secondary_agent orchestration", () => {
     });
     assert.ok(!result.error, `Should not error on finish_task: ${result.error}`);
     assert.equal(fetchCount, 1, "Should stop after finish_task tool call");
+    assert.ok(result.response?.includes("All done"), "Should return finish_task args.message as the final report");
+    assert.ok(!result.response?.includes('"tool":"finish_task"'), "Should not return the raw finish_task envelope");
+  });
+
+  it("returns args.message for an OpenAI-style finish_task with null content", async () => {
+    global.fetch = makeFetch(async () => new Response(
+      JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              type: "function",
+              function: {
+                name: "finish_task",
+                arguments: JSON.stringify({ message: "Final structured report", status: "success" }),
+              },
+            }],
+          },
+        }],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
+    const tools = createSubAgentTools(makeCtx({
+      pluginConfig: makeConfig({ subAgentAllowFileSystem: true }),
+    }));
+
+    const result = await callTool(tools, "consult_secondary_agent", {
+      task: "finish the task",
+      allow_tools: true,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.ok(result.response?.includes("Final structured report"));
+    assert.ok(!result.response?.includes("produced no output"));
+  });
+
+  it("surfaces an error status from finish_task", async () => {
+    global.fetch = makeFetch(async () => makeApiResponse(
+      JSON.stringify({ tool: "finish_task", args: { message: "Could not complete review", status: "error" } })
+    ));
+    const tools = createSubAgentTools(makeCtx({
+      pluginConfig: makeConfig({ subAgentAllowFileSystem: true }),
+    }));
+
+    const result = await callTool(tools, "consult_secondary_agent", {
+      task: "finish the task",
+      allow_tools: true,
+    });
+
+    assert.equal(result.status, "failed");
+    assert.ok(result.error?.includes("Could not complete review"));
+  });
+
+  it("does not report completion when the turn limit ends on a tool call", async () => {
+    global.fetch = makeFetch(async () => makeApiResponse(
+      JSON.stringify({ tool: "list_directory", args: {} })
+    ));
+    const tools = createSubAgentTools(makeCtx({
+      pluginConfig: makeConfig({ subAgentAllowFileSystem: true, subAgentLoopLimit: 1 }),
+    }));
+
+    const result = await callTool(tools, "consult_secondary_agent", {
+      task: "inspect the project",
+      allow_tools: true,
+    });
+
+    assert.equal(result.status, "stalled");
+    assert.ok(result.error?.includes("before producing a final report"));
+    assert.ok(!result.response, "An incomplete tool envelope must not be returned as a completed response");
   });
 
   it("extracts handoff_message from response", async () => {

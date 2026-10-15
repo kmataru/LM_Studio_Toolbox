@@ -212,6 +212,7 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
           let noToolCallCount = 0;
           let executedToolCallCount = 0;
           let finalContent = "";
+          let lastTurnWasToolCall = false;
           const filesModified: string[] = [];
           let handoffMessage = "";
           // M.2: token tracking — accumulate across all turns in this loop run
@@ -431,10 +432,31 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
                 // finish_task is the model's explicit termination signal — treat it
                 // like TASK_COMPLETED rather than falling through to "Tool not found".
                 if (toolCall.tool === "finish_task") {
-                  if (content.trim()) finalContent = content;
+                  const finishStatus = String(toolCall.args?.status ?? "success").trim().toLowerCase();
+                  const finishMessage = typeof toolCall.args?.message === "string"
+                    ? toolCall.args.message.trim()
+                    : "";
+
+                  if (["error", "failed", "failure"].includes(finishStatus)) {
+                    return {
+                      error: `Sub-agent failed: ${finishMessage || "Sub-agent reported task failure."}`,
+                      filesModified,
+                      status: "failed" as const,
+                      turnLog,
+                    };
+                  }
+
+                  // OpenAI-style tool calls commonly have content:null and place the
+                  // entire final report in args.message. Content-parsed JSON calls, on
+                  // the other hand, contain only the raw tool-call envelope.
+                  const proseContent = parsedMessage.toolCallSource === "content" ? "" : content.trim();
+                  finalContent = finishMessage || proseContent || "Sub-agent reported successful completion.";
+                  lastTurnWasToolCall = false;
+                  loops++;
                   break;
                 }
 
+                lastTurnWasToolCall = true;
                 noToolCallCount = 0;
                 executedToolCallCount++;
                 msgList.push({ role: "assistant", content });
@@ -757,6 +779,7 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
                 loops++;
 
               } else {
+                lastTurnWasToolCall = false;
                 // ── No tool call ───────────────────────────────────────────────
                 const shouldAutoFallbackRead =
                   toolsEnabled && useFS &&
@@ -841,6 +864,22 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
               msgList.length = 0;
               msgList.push(systemMsg, taskMsg, ...recentMsgs);
             }
+          }
+
+          // A tool call on the final permitted turn is progress, not completion.
+          // Returning completed here loses the tool output and gives the caller a
+          // raw JSON tool envelope instead of the promised final report.
+          if (loops >= loopLimit && lastTurnWasToolCall) {
+            const lastTool = turnLog[turnLog.length - 1];
+            const lastToolSummary = lastTool
+              ? `${lastTool.tool}${lastTool.keyArg ? `(${lastTool.keyArg})` : ""} → ${lastTool.brief}`
+              : "a tool call";
+            return {
+              error: `Sub-agent reached the ${loopLimit}-turn limit after ${lastToolSummary}, before producing a final report. Increase the Sub-Agent Turn Limit or narrow the task.`,
+              filesModified,
+              status: "stalled" as const,
+              turnLog,
+            };
           }
 
           if (finalContent) {
@@ -968,7 +1007,14 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
         } finally {
           subAgentRunning = false;
         }
-        if (primaryResult.error) return { error: primaryResult.error, status: primaryResult.status, turn_log: primaryResult.turnLog };
+        if (primaryResult.error) {
+          return {
+            error: primaryResult.error,
+            status: primaryResult.status,
+            generated_files: primaryResult.filesModified ?? [],
+            turn_log: primaryResult.turnLog,
+          };
+        }
 
         let finalResponse = primaryResult.response || "";
         let handoffMessage = primaryResult.handoff_message;
@@ -1052,11 +1098,17 @@ export function createSubAgentTools(ctx: ToolContext): Tool[] {
           task: task.substring(0, 300),
           agent_role,
           status: "completed",
-          response: finalResponse.substring(0, 8000),
+          response: finalResponse,
           generated_files: generatedFiles,
           handoff_message: handoffMessage,
         };
-        writeFile(LAST_RESULT_PATH, JSON.stringify(persistedResult, null, 2), "utf-8").catch(() => {});
+        try {
+          await mkdir(dirname(LAST_RESULT_PATH), { recursive: true });
+          await atomicWrite(LAST_RESULT_PATH, JSON.stringify(persistedResult, null, 2));
+        } catch (persistErr) {
+          const persistMessage = persistErr instanceof Error ? persistErr.message : String(persistErr);
+          toolCtx?.warn?.(`Sub-agent completed, but result replay could not be saved: ${persistMessage}`);
+        }
 
         return { response: finalResponse, generated_files: generatedFiles, handoff_message: handoffMessage, status: "completed", turn_log: allTurnLog };
       },
